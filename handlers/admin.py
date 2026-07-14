@@ -618,150 +618,108 @@ async def handle_setting_value(message: Message, state: FSMContext) -> None:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Block Management (Super Admin only)
+# Inline callback o'rniga text-based flow — callback muammolarini bartaraf etadi
 # ─────────────────────────────────────────────────────────────────────────────
 @router.message(F.text == "🏘️ Bloklarni boshqarish", IsSuperAdmin())
-async def manage_blocks(message: Message) -> None:
+async def manage_blocks(message: Message, state: FSMContext) -> None:
     try:
         async with AsyncSessionFactory() as session:
             result = await session.execute(select(Block).order_by(Block.name))
             blocks = result.scalars().all()
 
-        text = "🏘️ <b>Bloklarni boshqarish</b>\n\n"
+        lines = "🏘️ <b>Bloklarni boshqarish</b>\n\n"
         if blocks:
             for b in blocks:
-                status = "✅" if b.is_active else "❌"
-                text += f"{status} {b.id}. {html.escape(b.name)}\n"
+                icon = "✅" if b.is_active else "❌"
+                lines += f"{icon} <b>{b.id}</b>. {html.escape(b.name)}\n"
         else:
-            text += "Hali blok yo'q.\n"
+            lines += "Hali blok yo'q.\n"
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Yangi blok qo'shish", callback_data="block_add")],
-            *[
-                [
-                    InlineKeyboardButton(
-                        text=("🔴 O'chir" if b.is_active else "🟢 Yoq") + f" — {b.name}",
-                        callback_data=f"block_toggle:{b.id}"
-                    )
-                ]
-                for b in blocks
-            ],
-        ])
-        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+        lines += (
+            "\n<b>Buyruqlar:</b>\n"
+            "• Yangi blok qo'shish uchun: <code>+blok nomi</code>\n"
+            "  Masalan: <code>+1-blok</code>\n"
+            "• Blokni o'chirish/yoqish: <code>-ID</code>\n"
+            "  Masalan: <code>-3</code>"
+        )
+
+        # Save blocks list in state for toggle
+        await state.update_data(in_block_manager=True)
+        await state.set_state(AdminStates.add_block_name)
+        await message.answer(lines, parse_mode="HTML")
     except Exception as exc:
         logger.exception("manage_blocks error")
         await message.answer("⚠️ Xatolik yuz berdi.")
 
 
-@router.callback_query(F.data == "block_add")
-async def block_add_start(call: CallbackQuery, state: FSMContext) -> None:
-    # Manual super admin check — filter may miss Railway env IDs
-    if call.from_user.id not in settings.super_admin_ids:
-        from database.connection import AsyncSessionFactory
-        from database.models import Admin, AdminRole
-        from sqlalchemy import select
-        async with AsyncSessionFactory() as session:
-            res = await session.execute(
-                select(Admin).where(
-                    Admin.telegram_id == call.from_user.id,
-                    Admin.role == AdminRole.super_admin,
-                    Admin.is_active == True,  # noqa: E712
-                )
-            )
-            if not res.scalar_one_or_none():
-                await call.answer("❌ Ruxsat yo'q.", show_alert=True)
-                return
-    try:
-        await state.set_state(AdminStates.add_block_name)
-        await call.message.answer(
-            "➕ Yangi blok nomini kiriting (masalan: 1-blok):\n"
-            "/admin - bekor qilish",
-        )
-        await call.answer()
-        logger.info("block_add_start OK: user=%s env_ids=%s",
-                    call.from_user.id, settings.super_admin_ids)
-    except Exception as exc:
-        logger.exception("block_add_start error")
-        await call.answer("⚠️ Xatolik.", show_alert=True)
-
-
 @router.message(AdminStates.add_block_name, F.text)
-async def block_add_name(message: Message, state: FSMContext) -> None:
-    logger.info("block_add_name: user=%s text=%s", message.from_user.id, message.text[:40])
-    name = html.escape(message.text.strip())
-    if message.text.startswith("/"):
-        await state.clear()
-        await message.answer("❌ Bekor qilindi.")
-        return
-    if len(name) < 2:
-        await message.answer("⚠️ Blok nomi kamida 2 ta belgidan iborat bo'lishi kerak.")
-        return
-    try:
-        async with get_session() as session:
-            existing = await session.execute(select(Block).where(Block.name == name))
-            if existing.scalar_one_or_none():
-                await message.answer(f"⚠️ '{name}' nomli blok allaqachon mavjud.")
-                return
-            session.add(Block(name=name))
-        await state.clear()
-        await message.answer(f"✅ '{name}' bloki muvaffaqiyatli qo'shildi!")
-        logger.info("Block '%s' added by %s", name, message.from_user.id)
-    except Exception as exc:
-        logger.exception("block_add_name error")
-        await message.answer(f"⚠️ Xatolik: {exc}")
+async def block_manager_input(message: Message, state: FSMContext) -> None:
+    """
+    Handles both:
+      +blok nomi  → add new block
+      -ID         → toggle block active/inactive
+      /admin      → exit
+    """
+    text = message.text.strip()
+    logger.info("block_manager_input: user=%s text=%s", message.from_user.id, text[:40])
 
+    # Exit
+    if text.startswith("/"):
+        await state.clear()
+        await message.answer("✅ Blok boshqaruvidan chiqdingiz.")
+        return
 
-@router.callback_query(F.data.startswith("block_toggle:"))
-async def block_toggle(call: CallbackQuery) -> None:
-    if call.from_user.id not in settings.super_admin_ids:
-        from database.models import Admin, AdminRole
-        async with AsyncSessionFactory() as session:
-            res = await session.execute(
-                select(Admin).where(
-                    Admin.telegram_id == call.from_user.id,
-                    Admin.role == AdminRole.super_admin,
-                    Admin.is_active == True,  # noqa: E712
+    # ADD block: +blok nomi
+    if text.startswith("+"):
+        name = html.escape(text[1:].strip())
+        if len(name) < 2:
+            await message.answer("⚠️ Blok nomi kamida 2 ta belgi. Masalan: <code>+1-blok</code>", parse_mode="HTML")
+            return
+        try:
+            async with get_session() as session:
+                existing = await session.execute(select(Block).where(Block.name == name))
+                if existing.scalar_one_or_none():
+                    await message.answer(f"⚠️ '{name}' nomli blok allaqachon mavjud.")
+                    return
+                session.add(Block(name=name))
+            await message.answer(f"✅ '<b>{name}</b>' bloki qo'shildi!", parse_mode="HTML")
+            logger.info("Block '%s' added by %s", name, message.from_user.id)
+        except Exception as exc:
+            logger.exception("block add error")
+            await message.answer(f"⚠️ Xatolik: {exc}")
+        return
+
+    # TOGGLE block: -ID
+    if text.startswith("-"):
+        id_str = text[1:].strip()
+        if not id_str.isdigit():
+            await message.answer("⚠️ Format: <code>-3</code> (blok ID raqami)", parse_mode="HTML")
+            return
+        block_id = int(id_str)
+        try:
+            async with get_session() as session:
+                res = await session.execute(
+                    select(Block).where(Block.id == block_id).with_for_update()
                 )
-            )
-            if not res.scalar_one_or_none():
-                await call.answer("❌ Ruxsat yo'q.", show_alert=True)
-                return
-    block_id = int(call.data.split(":")[1])
-    try:
-        async with get_session() as session:
-            result = await session.execute(select(Block).where(Block.id == block_id).with_for_update())
-            block = result.scalar_one_or_none()
-            if not block:
-                await call.answer("Blok topilmadi.", show_alert=True)
-                return
-            block.is_active = not block.is_active
-            new_status = "faollashtirildi" if block.is_active else "o'chirildi"
+                block = res.scalar_one_or_none()
+                if not block:
+                    await message.answer(f"⚠️ ID={block_id} blok topilmadi.")
+                    return
+                block.is_active = not block.is_active
+                status = "faollashtirildi ✅" if block.is_active else "o'chirildi ❌"
+            await message.answer(f"✅ '<b>{html.escape(block.name)}</b>' {status}", parse_mode="HTML")
+        except Exception as exc:
+            logger.exception("block toggle error")
+            await message.answer(f"⚠️ Xatolik: {exc}")
+        return
 
-        await call.answer(f"✅ Blok {new_status}!")
-        await call.message.delete()
-        # Refresh the block list
-        async with AsyncSessionFactory() as session:
-            result = await session.execute(select(Block).order_by(Block.name))
-            blocks = result.scalars().all()
-
-        text = "🏘️ <b>Bloklarni boshqarish</b>\n\n"
-        for b in blocks:
-            status = "✅" if b.is_active else "❌"
-            text += f"{status} {b.id}. {html.escape(b.name)}\n"
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Yangi blok qo'shish", callback_data="block_add")],
-            *[
-                [InlineKeyboardButton(
-                    text=("🔴 O'chir" if b.is_active else "🟢 Yoq") + f" — {b.name}",
-                    callback_data=f"block_toggle:{b.id}"
-                )]
-                for b in blocks
-            ],
-        ])
-        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    except Exception as exc:
-        logger.exception("block_toggle error")
-        await call.answer("⚠️ Xatolik yuz berdi.", show_alert=True)
+    await message.answer(
+        "❓ Noto'g'ri format.\n"
+        "• Qo'shish: <code>+1-blok</code>\n"
+        "• O'chirish/yoqish: <code>-3</code>\n"
+        "• Chiqish: /admin",
+        parse_mode="HTML",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
