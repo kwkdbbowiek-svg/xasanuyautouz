@@ -12,7 +12,18 @@ class Settings(BaseSettings):
     SUPER_ADMIN_IDS: str = ""          # comma-separated telegram user IDs
 
     # ── Database ─────────────────────────────────────────────────────────────
-    DATABASE_URL: str                  # postgresql+asyncpg://user:pass@host/db
+    # Railway injects DATABASE_URL as postgresql:// — we auto-fix to asyncpg
+    DATABASE_URL: str = "sqlite+aiosqlite:///uysavdouz.db"  # fallback for local
+
+    @property
+    def async_database_url(self) -> str:
+        """Convert Railway's postgres:// or postgresql:// to asyncpg driver URL."""
+        url = self.DATABASE_URL
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif url.startswith("postgresql://") and "+asyncpg" not in url:
+            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return url
 
     # ── Security ─────────────────────────────────────────────────────────────
     THROTTLE_RATE: float = 1.2         # seconds between allowed messages

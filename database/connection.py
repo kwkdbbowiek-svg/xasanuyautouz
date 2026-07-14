@@ -23,20 +23,20 @@ from database.models import Base
 
 logger = logging.getLogger(__name__)
 
-_is_sqlite: bool = settings.DATABASE_URL.startswith("sqlite")
+_is_sqlite: bool = settings.async_database_url.startswith("sqlite")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Engine
 # ─────────────────────────────────────────────────────────────────────────────
 if _is_sqlite:
     engine: AsyncEngine = create_async_engine(
-        settings.DATABASE_URL,
+        settings.async_database_url,
         echo=False,
         connect_args={"check_same_thread": False},
     )
 else:
     engine: AsyncEngine = create_async_engine(  # type: ignore[no-redef]
-        settings.DATABASE_URL,
+        settings.async_database_url,
         echo=False,
         pool_size=10,
         max_overflow=20,
