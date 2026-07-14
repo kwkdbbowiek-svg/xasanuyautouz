@@ -654,18 +654,27 @@ async def manage_blocks(message: Message) -> None:
 
 @router.callback_query(F.data == "block_add", IsSuperAdmin())
 async def block_add_start(call: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AdminStates.add_block_name)
-    await call.message.answer("➕ Yangi blok nomini kiriting (masalan: 1-blok):")
-    await call.answer()
+    try:
+        await state.set_state(AdminStates.add_block_name)
+        await call.message.answer(
+            "➕ Yangi blok nomini kiriting (masalan: 1-blok, 2-blok):\n"
+            "Bekor qilish uchun /admin ni bosing.",
+        )
+        await call.answer()
+        logger.info("block_add_start: state set for user %s", call.from_user.id)
+    except Exception as exc:
+        logger.exception("block_add_start error")
+        await call.answer("⚠️ Xatolik yuz berdi.", show_alert=True)
 
 
 @router.message(AdminStates.add_block_name, IsSuperAdmin(), F.text)
 async def block_add_name(message: Message, state: FSMContext) -> None:
+    logger.info("block_add_name triggered for user %s, text: %s",
+                message.from_user.id, message.text[:50])
     name = html.escape(message.text.strip())
     if len(name) < 2:
         await message.answer("⚠️ Blok nomi kamida 2 ta belgidan iborat bo'lishi kerak.")
         return
-    # BUG FIX: clear state AFTER successful DB write, not before
     try:
         async with get_session() as session:
             existing = await session.execute(select(Block).where(Block.name == name))
@@ -674,7 +683,8 @@ async def block_add_name(message: Message, state: FSMContext) -> None:
                 return
             session.add(Block(name=name))
         await state.clear()
-        await message.answer(f"✅ '{name}' bloki muvaffaqiyatli qo'shildi.")
+        await message.answer(f"✅ '{name}' bloki muvaffaqiyatli qo'shildi!")
+        logger.info("Block '%s' added by user %s", name, message.from_user.id)
     except Exception as exc:
         logger.exception("block_add_name error")
         await message.answer("⚠️ Xatolik yuz berdi.")

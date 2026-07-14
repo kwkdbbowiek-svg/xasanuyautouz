@@ -42,7 +42,14 @@ class IsSuperAdmin(BaseFilter):
 
         # Then check DB
         admin = await _get_admin(user_id)
-        return admin is not None and admin.role == AdminRole.super_admin
+        result = admin is not None and admin.role == AdminRole.super_admin
+        if not result:
+            import logging
+            logging.getLogger(__name__).debug(
+                "IsSuperAdmin FAILED for user %s. env_ids=%s",
+                user_id, settings.super_admin_ids
+            )
+        return result
 
 
 class IsAnyAdmin(BaseFilter):

@@ -55,6 +55,9 @@ def setup_logging() -> None:
     logging.getLogger("aiogram").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
+    # Enable DEBUG for our own modules to trace filter failures
+    logging.getLogger("filters.admin_filters").setLevel(logging.DEBUG)
+    logging.getLogger("handlers.admin").setLevel(logging.DEBUG)
 
 
 logger = logging.getLogger(__name__)
