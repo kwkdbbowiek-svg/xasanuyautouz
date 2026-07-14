@@ -34,8 +34,23 @@ router = Router(name="admin")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FSM States
+# Helper: check super admin without relying on filter
 # ─────────────────────────────────────────────────────────────────────────────
+async def _is_super(user_id: int) -> bool:
+    """Returns True if user_id is a super admin (env OR DB)."""
+    if user_id in settings.super_admin_ids:
+        return True
+    async with AsyncSessionFactory() as session:
+        res = await session.execute(
+            select(Admin).where(
+                Admin.telegram_id == user_id,
+                Admin.role == AdminRole.super_admin,
+                Admin.is_active == True,  # noqa: E712
+            )
+        )
+        return res.scalar_one_or_none() is not None
+
+
 class AdminStates(StatesGroup):
     # Settings
     set_standard_price = State()
@@ -126,7 +141,7 @@ async def admin_panel(message: Message) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Statistics
 # ─────────────────────────────────────────────────────────────────────────────
-@router.message(F.text == "📊 Statistika", IsSuperAdmin())
+@router.message(F.text == "📊 Statistika")
 async def show_stats(message: Message) -> None:
     try:
         from sqlalchemy import func
@@ -533,7 +548,7 @@ async def reject_ad_reason(message: Message, state: FSMContext, bot: Bot) -> Non
 # ─────────────────────────────────────────────────────────────────────────────
 # Pricing Settings (Super Admin only)
 # ─────────────────────────────────────────────────────────────────────────────
-@router.message(F.text == "💰 Narxlarni o'zgartirish", IsSuperAdmin())
+@router.message(F.text == "💰 Narxlarni o'zgartirish")
 async def pricing_menu(message: Message) -> None:
     std = await _get_setting("standard_price")
     vip = await _get_setting("vip_price")
@@ -575,25 +590,43 @@ PRICE_SETTING_LABELS = {
 }
 
 
-@router.callback_query(F.data.startswith("setprice:"), IsSuperAdmin())
+@router.callback_query(F.data.startswith("setprice:"))
 async def setprice_callback(call: CallbackQuery, state: FSMContext) -> None:
+    # Inline auth check (IsSuperAdmin filter unreliable with Railway env vars)
+    if call.from_user.id not in settings.super_admin_ids:
+        async with AsyncSessionFactory() as session:
+            res = await session.execute(
+                select(Admin).where(
+                    Admin.telegram_id == call.from_user.id,
+                    Admin.role == AdminRole.super_admin,
+                    Admin.is_active == True,  # noqa: E712
+                )
+            )
+            if not res.scalar_one_or_none():
+                await call.answer("❌ Ruxsat yo'q.", show_alert=True)
+                return
     key = call.data.split(":")[1]
     label = PRICE_SETTING_LABELS.get(key, key)
     await state.update_data(setting_key=key)
     await state.set_state(AdminStates.set_standard_price)
-    await call.message.answer(f"✏️ Yangi qiymatni kiriting ({label}):")
+    await call.message.answer(f"✏️ Yangi qiymatni kiriting ({label}):\n/admin — bekor qilish")
     await call.answer()
 
 
-@router.message(AdminStates.set_standard_price, IsSuperAdmin(), F.text)
+@router.message(AdminStates.set_standard_price, F.text)
 async def handle_setting_value(message: Message, state: FSMContext) -> None:
+    if message.text.startswith("/"):
+        await state.clear()
+        await message.answer("❌ Bekor qilindi.")
+        return
     data = await state.get_data()
     key = data.get("setting_key", "")
     value = message.text.strip()
 
     numeric_keys = {
-        "standard_price", "vip_price", "buyer_sub_price", "seeker_sub_price",
-        "standard_duration_days", "vip_duration_days", "standard_ads_limit", "vip_ads_limit",
+        "standard_price", "vip_price",
+        "standard_duration_days", "vip_duration_days",
+        "standard_ads_limit", "vip_ads_limit",
     }
     if key in numeric_keys:
         clean = value.replace(" ", "").replace(",", "")
@@ -605,14 +638,17 @@ async def handle_setting_value(message: Message, state: FSMContext) -> None:
     await _set_setting(key, html.escape(value), message.from_user.id)
     await state.clear()
     label = PRICE_SETTING_LABELS.get(key, key)
-    await message.answer(f"✅ <b>{label}</b> muvaffaqiyatli yangilandi: <code>{value}</code>", parse_mode="HTML")
+    await message.answer(
+        f"✅ <b>{label}</b> yangilandi: <code>{value}</code>",
+        parse_mode="HTML",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Block Management (Super Admin only)
 # Inline callback o'rniga text-based flow — callback muammolarini bartaraf etadi
 # ─────────────────────────────────────────────────────────────────────────────
-@router.message(F.text == "🏘️ Bloklarni boshqarish", IsSuperAdmin())
+@router.message(F.text == "🏘️ Bloklarni boshqarish")
 async def manage_blocks(message: Message, state: FSMContext) -> None:
     try:
         async with AsyncSessionFactory() as session:
@@ -717,7 +753,7 @@ async def block_manager_input(message: Message, state: FSMContext) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Admin Management (Super Admin only)
 # ─────────────────────────────────────────────────────────────────────────────
-@router.message(F.text == "👥 Adminlarni boshqarish", IsSuperAdmin())
+@router.message(F.text == "👥 Adminlarni boshqarish")
 async def manage_admins(message: Message) -> None:
     try:
         async with AsyncSessionFactory() as session:
@@ -753,7 +789,7 @@ async def manage_admins(message: Message) -> None:
         await message.answer("⚠️ Xatolik yuz berdi.")
 
 
-@router.callback_query(F.data.startswith("addadmin:"), IsSuperAdmin())
+@router.callback_query(F.data.startswith("addadmin:"))
 async def addadmin_start(call: CallbackQuery, state: FSMContext) -> None:
     role_str = call.data.split(":")[1]
     await state.update_data(new_admin_role=role_str)
@@ -766,7 +802,7 @@ async def addadmin_start(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
 
 
-@router.message(AdminStates.add_admin_id, IsSuperAdmin(), F.text)
+@router.message(AdminStates.add_admin_id, F.text)
 async def addadmin_id(message: Message, state: FSMContext) -> None:
     id_str = message.text.strip()
     if not id_str.lstrip("-").isdigit():
@@ -810,7 +846,7 @@ async def addadmin_id(message: Message, state: FSMContext) -> None:
         await message.answer("⚠️ Xatolik yuz berdi.")
 
 
-@router.callback_query(F.data.startswith("deladmin:"), IsSuperAdmin())
+@router.callback_query(F.data.startswith("deladmin:"))
 async def delete_admin(call: CallbackQuery) -> None:
     admin_tid = int(call.data.split(":")[1])
     try:
@@ -831,7 +867,7 @@ async def delete_admin(call: CallbackQuery) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Excel export shortcut from admin panel
 # ─────────────────────────────────────────────────────────────────────────────
-@router.message(F.text == "📥 Excel yuklab olish", IsSuperAdmin())
+@router.message(F.text == "📥 Excel yuklab olish")
 async def admin_excel(message: Message) -> None:
     from utils.excel_exporter import export_users_to_excel
     try:
@@ -850,7 +886,7 @@ async def admin_excel(message: Message) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # User Limit & Subscription Management (Super Admin only)
 # ─────────────────────────────────────────────────────────────────────────────
-@router.message(F.text == "👤 Foydalanuvchi limitini o'zgartirish", IsSuperAdmin())
+@router.message(F.text == "👤 Foydalanuvchi limitini o'zgartirish")
 async def user_limit_start(message: Message, state: FSMContext) -> None:
     await state.set_state(AdminStates.find_user_for_limit)
     await message.answer(
@@ -862,7 +898,7 @@ async def user_limit_start(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(AdminStates.find_user_for_limit, IsSuperAdmin(), F.text)
+@router.message(AdminStates.find_user_for_limit, F.text)
 async def find_user_for_limit(message: Message, state: FSMContext, bot: Bot) -> None:
     from sqlalchemy import func as sqlfunc
     if message.text == "❌ Bekor qilish":
@@ -975,7 +1011,7 @@ async def find_user_for_limit(message: Message, state: FSMContext, bot: Bot) -> 
 
 
 # ── Inline: Add extra limit ───────────────────────────────────────────────────
-@router.callback_query(F.data.startswith("ulimit_add:"), IsSuperAdmin())
+@router.callback_query(F.data.startswith("ulimit_add:"))
 async def ulimit_add_start(call: CallbackQuery, state: FSMContext) -> None:
     user_id = int(call.data.split(":")[1])
     await state.update_data(target_user_id=user_id)
@@ -984,7 +1020,7 @@ async def ulimit_add_start(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
 
 
-@router.message(AdminStates.set_extra_limit_amount, IsSuperAdmin(), F.text)
+@router.message(AdminStates.set_extra_limit_amount, F.text)
 async def set_extra_limit_amount(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     user_id = data["target_user_id"]
@@ -1030,7 +1066,7 @@ async def set_extra_limit_amount(message: Message, state: FSMContext, bot: Bot) 
 
 
 # ── Inline: Zero out limit ────────────────────────────────────────────────────
-@router.callback_query(F.data.startswith("ulimit_zero:"), IsSuperAdmin())
+@router.callback_query(F.data.startswith("ulimit_zero:"))
 async def ulimit_zero(call: CallbackQuery, bot: Bot) -> None:
     user_id = int(call.data.split(":")[1])
     try:
@@ -1064,7 +1100,7 @@ async def ulimit_zero(call: CallbackQuery, bot: Bot) -> None:
 
 
 # ── Inline: Extend subscription ───────────────────────────────────────────────
-@router.callback_query(F.data.startswith("ulimit_extend:"), IsSuperAdmin())
+@router.callback_query(F.data.startswith("ulimit_extend:"))
 async def ulimit_extend_start(call: CallbackQuery, state: FSMContext) -> None:
     user_id = int(call.data.split(":")[1])
     await state.update_data(target_user_id=user_id)
@@ -1075,7 +1111,7 @@ async def ulimit_extend_start(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
 
 
-@router.message(AdminStates.extend_sub_days, IsSuperAdmin(), F.text)
+@router.message(AdminStates.extend_sub_days, F.text)
 async def extend_sub_days(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     user_id = data["target_user_id"]
