@@ -103,7 +103,9 @@ class ThrottlingMiddleware(BaseMiddleware):
             return
 
         # ── 1. DB-persisted ban (survives restarts) ───────────────────────
-        if ban_exp is None:  # not in hot cache → check DB once
+        # BUG FIX: Only hit DB if user is NOT in hot cache yet.
+        # Write a sentinel (0.0) for clean users so we don't hit DB every time.
+        if user_id not in _banned_cache:
             async with AsyncSessionFactory() as session:
                 from sqlalchemy import select as sa_select
                 res = await session.execute(
@@ -116,6 +118,9 @@ class ThrottlingMiddleware(BaseMiddleware):
                     await self._send_once(bot, event, user_id,
                                           "⛔ Siz bloklangansiz. Keyinroq urinib ko'ring.")
                     return
+                else:
+                    # Mark as "checked and clean" — sentinel value 0.0
+                    _banned_cache[user_id] = 0.0
 
         # ── 2. DDoS burst detection (sliding 1-second window) ─────────────
         window = _burst_window[user_id]

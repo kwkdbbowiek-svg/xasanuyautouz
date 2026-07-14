@@ -523,7 +523,14 @@ async def adpost_confirm(call: CallbackQuery, state: FSMContext, bot: Bot) -> No
                 await call.answer("Obunangiz topilmadi yoki muddati tugagan.", show_alert=True)
                 return
 
-            limit = await _get_effective_limit(call.from_user.id, locked_sub)
+            limit_key = "vip_ads_limit" if locked_sub.sub_type == SubscriptionType.vip else "standard_ads_limit"
+            base_limit = int(await _get_setting(limit_key))
+            # Check per-user override within the same session (no nested session)
+            ov_res = await session.execute(
+                select(UserAdLimit).where(UserAdLimit.user_id == call.from_user.id)
+            )
+            ov = ov_res.scalar_one_or_none()
+            limit = base_limit + (ov.extra_limit if ov else 0)
             current_count = (await session.execute(
                 select(func.count(Ad.id)).where(
                     Ad.owner_id == call.from_user.id,

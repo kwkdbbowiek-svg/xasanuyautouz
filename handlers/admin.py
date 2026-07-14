@@ -405,10 +405,26 @@ async def pending_ads(message: Message) -> None:
                 ]
             ])
             try:
-                if ad.media_file_id and ad.media_type == "photo":
-                    await message.answer_photo(photo=ad.media_file_id, caption=caption, parse_mode="HTML", reply_markup=kb)
-                elif ad.media_file_id and ad.media_type == "video":
-                    await message.answer_video(video=ad.media_file_id, caption=caption, parse_mode="HTML", reply_markup=kb)
+                # BUG FIX: Ad.media_file_id no longer exists — fetch from AdMedia table
+                from database.models import AdMedia
+                async with AsyncSessionFactory() as media_session:
+                    media_res = await media_session.execute(
+                        select(AdMedia).where(AdMedia.ad_id == ad.id).order_by(AdMedia.sort_order)
+                    )
+                    media_files = media_res.scalars().all()
+                    photos = [m for m in media_files if m.media_type.value == "photo"]
+                    videos = [m for m in media_files if m.media_type.value == "video"]
+
+                if photos:
+                    await message.answer_photo(
+                        photo=photos[0].file_id, caption=caption,
+                        parse_mode="HTML", reply_markup=kb
+                    )
+                elif videos:
+                    await message.answer_video(
+                        video=videos[0].file_id, caption=caption,
+                        parse_mode="HTML", reply_markup=kb
+                    )
                 else:
                     await message.answer(caption, parse_mode="HTML", reply_markup=kb)
             except Exception:
@@ -649,7 +665,7 @@ async def block_add_name(message: Message, state: FSMContext) -> None:
     if len(name) < 2:
         await message.answer("⚠️ Blok nomi kamida 2 ta belgidan iborat bo'lishi kerak.")
         return
-    await state.clear()
+    # BUG FIX: clear state AFTER successful DB write, not before
     try:
         async with get_session() as session:
             existing = await session.execute(select(Block).where(Block.name == name))
@@ -657,6 +673,7 @@ async def block_add_name(message: Message, state: FSMContext) -> None:
                 await message.answer(f"⚠️ '{name}' nomli blok allaqachon mavjud.")
                 return
             session.add(Block(name=name))
+        await state.clear()
         await message.answer(f"✅ '{name}' bloki muvaffaqiyatli qo'shildi.")
     except Exception as exc:
         logger.exception("block_add_name error")
@@ -955,8 +972,9 @@ async def find_user_for_limit(message: Message, state: FSMContext, bot: Bot) -> 
             ],
         ])
 
-        await state.update_data(target_user_id=user.id, target_user_name=user.full_name)
-        await state.clear()  # clear state but keep the inline buttons active
+        # BUG FIX: state.clear() was wiping target_user_id immediately.
+        # Do NOT clear state here — user_id is in callback_data so FSM state
+        # is not needed after this point anyway.
         await message.answer(info_text, parse_mode="HTML", reply_markup=kb)
 
     except Exception as exc:
@@ -1129,133 +1147,3 @@ async def extend_sub_days(message: Message, state: FSMContext, bot: Bot) -> None
         await notify_super_admins(bot, f"Obuna uzaytirish xatosi: {exc}")
         await message.answer("⚠️ Xatolik yuz berdi.")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Admin Management (Super Admin only)
-# ─────────────────────────────────────────────────────────────────────────────
-@router.message(F.text == "👥 Adminlarni boshqarish", IsSuperAdmin())
-async def manage_admins(message: Message) -> None:
-    try:
-        async with AsyncSessionFactory() as session:
-            result = await session.execute(
-                select(Admin).where(Admin.is_active == True).order_by(Admin.created_at)  # noqa: E712
-            )
-            admins = result.scalars().all()
-
-        text = "👥 <b>Yordamchi adminlar:</b>\n\n"
-        if admins:
-            for a in admins:
-                text += f"• {html.escape(a.full_name)} | <code>{a.telegram_id}</code> — {a.role.value}\n"
-        else:
-            text += "Hali yordamchi admin yo'q.\n"
-
-        role_buttons = [
-            [InlineKeyboardButton(text="➕ Seller Admin", callback_data="addadmin:seller_admin")],
-            [InlineKeyboardButton(text="➕ Buyer Admin", callback_data="addadmin:buyer_admin")],
-            [InlineKeyboardButton(text="➕ Owner Admin", callback_data="addadmin:owner_admin")],
-            [InlineKeyboardButton(text="➕ Seeker Admin", callback_data="addadmin:seeker_admin")],
-        ]
-        if admins:
-            role_buttons += [
-                [InlineKeyboardButton(
-                    text=f"🗑️ {a.full_name} ({a.role.value})",
-                    callback_data=f"deladmin:{a.telegram_id}"
-                )]
-                for a in admins
-            ]
-
-        kb = InlineKeyboardMarkup(inline_keyboard=role_buttons)
-        await message.answer(text, reply_markup=kb, parse_mode="HTML")
-    except Exception as exc:
-        logger.exception("manage_admins error")
-        await message.answer("⚠️ Xatolik yuz berdi.")
-
-
-@router.callback_query(F.data.startswith("addadmin:"), IsSuperAdmin())
-async def addadmin_start(call: CallbackQuery, state: FSMContext) -> None:
-    role_str = call.data.split(":")[1]
-    await state.update_data(new_admin_role=role_str)
-    await state.set_state(AdminStates.add_admin_id)
-    await call.message.answer(
-        f"👤 <b>{role_str}</b> uchun admin Telegram ID sini kiriting:",
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-
-@router.message(AdminStates.add_admin_id, IsSuperAdmin(), F.text)
-async def addadmin_id(message: Message, state: FSMContext) -> None:
-    id_str = message.text.strip()
-    if not id_str.lstrip("-").isdigit():
-        await message.answer("⚠️ Telegram ID faqat raqamlardan iborat bo'lishi kerak.")
-        return
-    new_id = int(id_str)
-    data = await state.get_data()
-    role_str = data["new_admin_role"]
-    await state.clear()
-    try:
-        async with AsyncSessionFactory() as session:
-            u_res = await session.execute(select(User).where(User.id == new_id))
-            user = u_res.scalar_one_or_none()
-            full_name = user.full_name if user else f"Admin_{new_id}"
-
-        async with get_session() as session:
-            existing = await session.execute(select(Admin).where(Admin.telegram_id == new_id))
-            adm = existing.scalar_one_or_none()
-            if adm:
-                adm.role = AdminRole(role_str)
-                adm.is_active = True
-                adm.full_name = full_name
-            else:
-                session.add(Admin(
-                    telegram_id=new_id,
-                    full_name=full_name,
-                    role=AdminRole(role_str),
-                    added_by=message.from_user.id,
-                    is_active=True,
-                ))
-
-        await message.answer(
-            f"✅ <code>{new_id}</code> foydalanuvchisi <b>{role_str}</b> sifatida tayinlandi.",
-            parse_mode="HTML",
-        )
-    except Exception as exc:
-        logger.exception("addadmin_id error")
-        await message.answer("⚠️ Xatolik yuz berdi.")
-
-
-@router.callback_query(F.data.startswith("deladmin:"), IsSuperAdmin())
-async def delete_admin(call: CallbackQuery) -> None:
-    admin_tid = int(call.data.split(":")[1])
-    try:
-        async with get_session() as session:
-            result = await session.execute(
-                select(Admin).where(Admin.telegram_id == admin_tid).with_for_update()
-            )
-            adm = result.scalar_one_or_none()
-            if adm:
-                adm.is_active = False
-        await call.answer(f"✅ Admin {admin_tid} o'chirildi!")
-        await call.message.edit_reply_markup(reply_markup=None)
-    except Exception as exc:
-        logger.exception("delete_admin error")
-        await call.answer("⚠️ Xatolik yuz berdi.", show_alert=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Excel export shortcut from admin panel
-# ─────────────────────────────────────────────────────────────────────────────
-@router.message(F.text == "📥 Excel yuklab olish", IsSuperAdmin())
-async def admin_excel(message: Message) -> None:
-    from utils.excel_exporter import export_users_to_excel
-    import os
-    try:
-        await message.answer("⏳ Excel fayl tayyorlanmoqda...")
-        file_path = await export_users_to_excel()
-        from aiogram.types import FSInputFile
-        doc = FSInputFile(file_path, filename="uysavdo_users.xlsx")
-        await message.answer_document(doc, caption="📥 Foydalanuvchilar ro'yxati")
-        os.remove(file_path)
-    except Exception as exc:
-        logger.exception("admin_excel error")
-        await message.answer("⚠️ Excel fayl yaratishda xatolik yuz berdi.")

@@ -1,7 +1,6 @@
 """
 APScheduler background tasks.
-- expire_subscriptions: runs every hour, marks expired subscriptions inactive
-  and sets related ads to 'expired' status.
+BUG FIX: expire pending ads too (not only active).
 """
 from __future__ import annotations
 
@@ -19,18 +18,12 @@ logger = logging.getLogger(__name__)
 
 
 async def expire_subscriptions() -> None:
-    """
-    1. Find subscriptions that have passed their expires_at date.
-    2. Mark them is_active = False.
-    3. Mark the owner's ads as 'expired' so they disappear from listings.
-    """
     now = datetime.now(timezone.utc)
     try:
         async with AsyncSessionFactory() as session:
-            # Find expired but still-active subscriptions
             result = await session.execute(
                 select(Subscription).where(
-                    Subscription.is_active == True,  # noqa: E712
+                    Subscription.is_active == True,   # noqa: E712
                     Subscription.expires_at <= now,
                 )
             )
@@ -44,29 +37,27 @@ async def expire_subscriptions() -> None:
                 sub.is_active = False
                 expired_user_ids.append(sub.user_id)
 
-            # Expire ads for users whose subscription ended
             if expired_user_ids:
+                # BUG FIX: expire both active AND pending ads
                 await session.execute(
                     update(Ad)
                     .where(
                         Ad.owner_id.in_(expired_user_ids),
-                        Ad.status == AdStatus.active,
+                        Ad.status.in_([AdStatus.active, AdStatus.pending]),
                     )
                     .values(status=AdStatus.expired)
                 )
 
             await session.commit()
             logger.info(
-                "Scheduler: expired %d subscriptions and related ads for users: %s",
-                len(expired_subs),
-                expired_user_ids,
+                "Scheduler: expired %d subscriptions for users: %s",
+                len(expired_subs), expired_user_ids,
             )
     except Exception as exc:
         logger.exception("expire_subscriptions scheduler error: %s", exc)
 
 
 def create_scheduler() -> AsyncIOScheduler:
-    """Create and configure the APScheduler instance."""
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(
         expire_subscriptions,

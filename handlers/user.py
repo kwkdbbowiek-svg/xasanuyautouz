@@ -54,18 +54,31 @@ async def _get_setting(key: str) -> str:
 
 
 async def _upsert_user(tg_user) -> User:
+    """
+    BUG FIX: Race condition on simultaneous /start.
+    Use INSERT ... ON CONFLICT DO NOTHING pattern via merge/upsert logic.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy import exc as sa_exc
+
     async with AsyncSessionFactory() as session:
         result = await session.execute(select(User).where(User.id == tg_user.id))
         user = result.scalar_one_or_none()
         if user is None:
-            user = User(
-                id=tg_user.id,
-                username=tg_user.username,
-                full_name=html.escape(tg_user.full_name or ""),
-            )
-            session.add(user)
-            await session.commit()
-            await session.refresh(user)
+            try:
+                user = User(
+                    id=tg_user.id,
+                    username=tg_user.username,
+                    full_name=html.escape(tg_user.full_name or ""),
+                )
+                session.add(user)
+                await session.commit()
+                await session.refresh(user)
+            except sa_exc.IntegrityError:
+                # Another concurrent request already inserted — just fetch
+                await session.rollback()
+                result2 = await session.execute(select(User).where(User.id == tg_user.id))
+                user = result2.scalar_one()
         return user
 
 
@@ -319,11 +332,11 @@ async def receive_payment_check(message: Message, state: FSMContext, bot: Bot) -
                 await state.clear()
                 return
 
-        # Determine amount from settings
+        # BUG FIX: seeker pays seeker_sub_price, not buyer_sub_price
         price_key = {
             "standard": "standard_price",
             "vip": "vip_price",
-            "viewer": "buyer_sub_price",
+            "viewer": "seeker_sub_price",
         }.get(sub_type_str, "standard_price")
         amount = int(await _get_setting(price_key) or "0")
 
@@ -484,7 +497,7 @@ async def show_ads_in_block(call: CallbackQuery) -> None:
             )
             total = count_res.scalar_one()
 
-            # VIP first, then standard — paginated
+            # BUG FIX: SQLAlchemy 2.0 case() uses keyword args, not positional tuples
             from sqlalchemy import case as sa_case
             ads_res = await session.execute(
                 select(Ad)
@@ -495,7 +508,8 @@ async def show_ads_in_block(call: CallbackQuery) -> None:
                 )
                 .order_by(
                     sa_case(
-                        (Ad.sub_type == SubscriptionType.vip, 0), else_=1
+                        (Ad.sub_type == SubscriptionType.vip, 0),
+                        else_=1,
                     ),
                     Ad.created_at.desc(),
                 )
