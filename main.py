@@ -68,6 +68,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 async def on_startup(bot: Bot) -> None:
     logger.info("Bot starting up...")
+    logger.info("Super admin IDs from env: %s", settings.super_admin_ids)
     await init_db()
     await seed_default_settings()
     await notify_super_admins(bot, "🤖 Bot muvaffaqiyatli ishga tushdi!")

@@ -652,26 +652,46 @@ async def manage_blocks(message: Message) -> None:
         await message.answer("⚠️ Xatolik yuz berdi.")
 
 
-@router.callback_query(F.data == "block_add", IsSuperAdmin())
+@router.callback_query(F.data == "block_add")
 async def block_add_start(call: CallbackQuery, state: FSMContext) -> None:
+    # Manual super admin check — filter may miss Railway env IDs
+    if call.from_user.id not in settings.super_admin_ids:
+        from database.connection import AsyncSessionFactory
+        from database.models import Admin, AdminRole
+        from sqlalchemy import select
+        async with AsyncSessionFactory() as session:
+            res = await session.execute(
+                select(Admin).where(
+                    Admin.telegram_id == call.from_user.id,
+                    Admin.role == AdminRole.super_admin,
+                    Admin.is_active == True,  # noqa: E712
+                )
+            )
+            if not res.scalar_one_or_none():
+                await call.answer("❌ Ruxsat yo'q.", show_alert=True)
+                return
     try:
         await state.set_state(AdminStates.add_block_name)
         await call.message.answer(
-            "➕ Yangi blok nomini kiriting (masalan: 1-blok, 2-blok):\n"
-            "Bekor qilish uchun /admin ni bosing.",
+            "➕ Yangi blok nomini kiriting (masalan: 1-blok):\n"
+            "/admin - bekor qilish",
         )
         await call.answer()
-        logger.info("block_add_start: state set for user %s", call.from_user.id)
+        logger.info("block_add_start OK: user=%s env_ids=%s",
+                    call.from_user.id, settings.super_admin_ids)
     except Exception as exc:
         logger.exception("block_add_start error")
-        await call.answer("⚠️ Xatolik yuz berdi.", show_alert=True)
+        await call.answer("⚠️ Xatolik.", show_alert=True)
 
 
-@router.message(AdminStates.add_block_name, IsSuperAdmin(), F.text)
+@router.message(AdminStates.add_block_name, F.text)
 async def block_add_name(message: Message, state: FSMContext) -> None:
-    logger.info("block_add_name triggered for user %s, text: %s",
-                message.from_user.id, message.text[:50])
+    logger.info("block_add_name: user=%s text=%s", message.from_user.id, message.text[:40])
     name = html.escape(message.text.strip())
+    if message.text.startswith("/"):
+        await state.clear()
+        await message.answer("❌ Bekor qilindi.")
+        return
     if len(name) < 2:
         await message.answer("⚠️ Blok nomi kamida 2 ta belgidan iborat bo'lishi kerak.")
         return
@@ -684,14 +704,27 @@ async def block_add_name(message: Message, state: FSMContext) -> None:
             session.add(Block(name=name))
         await state.clear()
         await message.answer(f"✅ '{name}' bloki muvaffaqiyatli qo'shildi!")
-        logger.info("Block '%s' added by user %s", name, message.from_user.id)
+        logger.info("Block '%s' added by %s", name, message.from_user.id)
     except Exception as exc:
         logger.exception("block_add_name error")
-        await message.answer("⚠️ Xatolik yuz berdi.")
+        await message.answer(f"⚠️ Xatolik: {exc}")
 
 
-@router.callback_query(F.data.startswith("block_toggle:"), IsSuperAdmin())
+@router.callback_query(F.data.startswith("block_toggle:"))
 async def block_toggle(call: CallbackQuery) -> None:
+    if call.from_user.id not in settings.super_admin_ids:
+        from database.models import Admin, AdminRole
+        async with AsyncSessionFactory() as session:
+            res = await session.execute(
+                select(Admin).where(
+                    Admin.telegram_id == call.from_user.id,
+                    Admin.role == AdminRole.super_admin,
+                    Admin.is_active == True,  # noqa: E712
+                )
+            )
+            if not res.scalar_one_or_none():
+                await call.answer("❌ Ruxsat yo'q.", show_alert=True)
+                return
     block_id = int(call.data.split(":")[1])
     try:
         async with get_session() as session:
