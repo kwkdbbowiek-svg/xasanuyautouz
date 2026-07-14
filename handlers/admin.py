@@ -537,8 +537,6 @@ async def reject_ad_reason(message: Message, state: FSMContext, bot: Bot) -> Non
 async def pricing_menu(message: Message) -> None:
     std = await _get_setting("standard_price")
     vip = await _get_setting("vip_price")
-    buyer = await _get_setting("buyer_sub_price")
-    seeker = await _get_setting("seeker_sub_price")
     std_days = await _get_setting("standard_duration_days")
     vip_days = await _get_setting("vip_duration_days")
     std_limit = await _get_setting("standard_ads_limit")
@@ -549,16 +547,12 @@ async def pricing_menu(message: Message) -> None:
         f"💰 <b>Joriy narxlar:</b>\n\n"
         f"📦 Standart: {std} so'm / {std_days} kun / {std_limit} ta e'lon\n"
         f"⭐ VIP: {vip} so'm / {vip_days} kun / {vip_limit} ta e'lon\n"
-        f"🔍 Oluvchi obunasi: {buyer} so'm\n"
-        f"🔑 Qidiruvchi obunasi: {seeker} so'm\n"
         f"💳 Karta: {card}\n\n"
         "Quyidagi tugmalardan birini bosing:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Standart narx", callback_data="setprice:standard_price")],
         [InlineKeyboardButton(text="⭐ VIP narx", callback_data="setprice:vip_price")],
-        [InlineKeyboardButton(text="🔍 Oluvchi obuna narxi", callback_data="setprice:buyer_sub_price")],
-        [InlineKeyboardButton(text="🔑 Qidiruvchi obuna narxi", callback_data="setprice:seeker_sub_price")],
         [InlineKeyboardButton(text="📅 Standart muddat (kun)", callback_data="setprice:standard_duration_days")],
         [InlineKeyboardButton(text="📅 VIP muddat (kun)", callback_data="setprice:vip_duration_days")],
         [InlineKeyboardButton(text="🔢 Standart e'lon limiti", callback_data="setprice:standard_ads_limit")],
@@ -572,8 +566,6 @@ async def pricing_menu(message: Message) -> None:
 PRICE_SETTING_LABELS = {
     "standard_price": "Standart obuna narxi (so'm)",
     "vip_price": "VIP obuna narxi (so'm)",
-    "buyer_sub_price": "Oluvchi obuna narxi (so'm)",
-    "seeker_sub_price": "Qidiruvchi obuna narxi (so'm)",
     "standard_duration_days": "Standart obuna muddati (kun)",
     "vip_duration_days": "VIP obuna muddati (kun)",
     "standard_ads_limit": "Standart e'lon limiti",
@@ -742,10 +734,8 @@ async def manage_admins(message: Message) -> None:
             text += "Hali yordamchi admin yo'q.\n"
 
         role_buttons = [
-            [InlineKeyboardButton(text="➕ Seller Admin", callback_data="addadmin:seller_admin")],
-            [InlineKeyboardButton(text="➕ Buyer Admin", callback_data="addadmin:buyer_admin")],
-            [InlineKeyboardButton(text="➕ Owner Admin", callback_data="addadmin:owner_admin")],
-            [InlineKeyboardButton(text="➕ Seeker Admin", callback_data="addadmin:seeker_admin")],
+            [InlineKeyboardButton(text="➕ Seller Admin (Sotuvchi)", callback_data="addadmin:seller_admin")],
+            [InlineKeyboardButton(text="➕ Owner Admin (Kvartira egasi)", callback_data="addadmin:owner_admin")],
         ]
         if admins:
             role_buttons += [
