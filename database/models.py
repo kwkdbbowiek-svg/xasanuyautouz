@@ -1,6 +1,11 @@
 """
-SQLAlchemy 2.0 ORM models for UySavdo Telegram bot.
-All queries must go through ORM — no raw SQL strings anywhere.
+SQLAlchemy 2.0 ORM models — UySavdo Telegram bot.
+
+Changes v2:
+  - AdMedia table: up to 10 photos + 1 video per ad (replaces single media_file_id)
+  - UserAdLimit: per-user limit overrides set by admin
+  - Subscription: safe upsert pattern (one active sub per user per type)
+  - All queries use .scalars().first() where multiple rows possible
 """
 from __future__ import annotations
 
@@ -10,14 +15,11 @@ from typing import Optional, List
 
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, Enum, ForeignKey,
-    Integer, String, Text, func, UniqueConstraint, Index,
+    Integer, String, Text, func, UniqueConstraint, Index, SmallInteger,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Base
-# ─────────────────────────────────────────────────────────────────────────────
 class Base(DeclarativeBase):
     pass
 
@@ -26,10 +28,10 @@ class Base(DeclarativeBase):
 # Enums
 # ─────────────────────────────────────────────────────────────────────────────
 class UserRole(str, enum.Enum):
-    seller = "seller"        # Uy sotuvchi
-    buyer = "buyer"          # Uy sotib oluvchi
-    owner = "owner"          # Kvartira ijaraga beruvchi
-    seeker = "seeker"        # Kvartira ijaraga oluvchi
+    seller = "seller"
+    buyer = "buyer"
+    owner = "owner"
+    seeker = "seeker"
 
 
 class AdminRole(str, enum.Enum):
@@ -43,11 +45,11 @@ class AdminRole(str, enum.Enum):
 class SubscriptionType(str, enum.Enum):
     standard = "standard"
     vip = "vip"
-    viewer = "viewer"   # for buyer / seeker
+    viewer = "viewer"
 
 
 class AdStatus(str, enum.Enum):
-    pending = "pending"         # waiting for admin approval
+    pending = "pending"
     active = "active"
     rejected = "rejected"
     expired = "expired"
@@ -55,8 +57,8 @@ class AdStatus(str, enum.Enum):
 
 
 class AdType(str, enum.Enum):
-    sale = "sale"        # Sotish (Seller)
-    rent = "rent"        # Ijaraga berish (Owner)
+    sale = "sale"
+    rent = "rent"
 
 
 class PaymentStatus(str, enum.Enum):
@@ -65,13 +67,18 @@ class PaymentStatus(str, enum.Enum):
     rejected = "rejected"
 
 
+class MediaType(str, enum.Enum):
+    photo = "photo"
+    video = "video"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Users
 # ─────────────────────────────────────────────────────────────────────────────
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)           # Telegram user_id
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     username: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     full_name: Mapped[str] = mapped_column(String(256))
     phone: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
@@ -85,7 +92,6 @@ class User(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    # Relationships
     subscriptions: Mapped[List["Subscription"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
@@ -95,9 +101,40 @@ class User(Base):
     payments: Mapped[List["Payment"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    ad_limit_override: Mapped[Optional["UserAdLimit"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", uselist=False
+    )
 
     def __repr__(self) -> str:
         return f"<User id={self.id} role={self.role}>"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UserAdLimit — per-user ad limit override set by admin
+# ─────────────────────────────────────────────────────────────────────────────
+class UserAdLimit(Base):
+    """
+    Admin can grant extra ad slots to a specific user beyond their subscription
+    limit.  extra_limit is ADDED on top of the subscription base limit.
+    """
+    __tablename__ = "user_ad_limits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"),
+        unique=True, nullable=False
+    )
+    extra_limit: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    note: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    set_by: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    user: Mapped["User"] = relationship(back_populates="ad_limit_override")
+
+    def __repr__(self) -> str:
+        return f"<UserAdLimit user={self.user_id} extra={self.extra_limit}>"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,7 +160,7 @@ class Admin(Base):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Blocks (Domlar / Mahallalar)
+# Blocks
 # ─────────────────────────────────────────────────────────────────────────────
 class Block(Base):
     __tablename__ = "blocks"
@@ -144,6 +181,9 @@ class Block(Base):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Subscriptions
+# NOTE: A user can have multiple historical subscription rows.
+#       "Active" subscription = is_active=True AND expires_at > now.
+#       Use .scalars().first() NOT .scalar_one_or_none() when querying.
 # ─────────────────────────────────────────────────────────────────────────────
 class Subscription(Base):
     __tablename__ = "subscriptions"
@@ -170,6 +210,7 @@ class Subscription(Base):
 
     __table_args__ = (
         Index("ix_subscriptions_user_active", "user_id", "is_active"),
+        Index("ix_subscriptions_user_type_active", "user_id", "sub_type", "is_active"),
     )
 
     def __repr__(self) -> str:
@@ -187,14 +228,13 @@ class Payment(Base):
         BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     sub_type: Mapped[SubscriptionType] = mapped_column(Enum(SubscriptionType), nullable=False)
-    # Chek fraud protection: file_unique_id must be unique in DB
     file_unique_id: Mapped[str] = mapped_column(String(128), nullable=False)
     file_id: Mapped[str] = mapped_column(String(256), nullable=False)
-    amount: Mapped[int] = mapped_column(Integer, nullable=False)            # UZS
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[PaymentStatus] = mapped_column(
         Enum(PaymentStatus), default=PaymentStatus.pending, nullable=False
     )
-    reviewed_by: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)   # admin telegram_id
+    reviewed_by: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     reject_reason: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -216,7 +256,7 @@ class Payment(Base):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ads (E'lonlar)
+# Ads
 # ─────────────────────────────────────────────────────────────────────────────
 class Ad(Base):
     __tablename__ = "ads"
@@ -234,15 +274,12 @@ class Ad(Base):
     )
     title: Mapped[str] = mapped_column(String(256), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    price: Mapped[int] = mapped_column(Integer, nullable=False)            # UZS
+    price: Mapped[int] = mapped_column(Integer, nullable=False)
     rooms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     floor: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     total_floors: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    area: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)   # m²
+    area: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     contact_phone: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
-    # Media: stored as Telegram file_id (photo or video)
-    media_file_id: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
-    media_type: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)  # "photo" | "video"
     status: Mapped[AdStatus] = mapped_column(
         Enum(AdStatus), default=AdStatus.pending, nullable=False
     )
@@ -259,6 +296,9 @@ class Ad(Base):
 
     owner: Mapped["User"] = relationship(back_populates="ads")
     block: Mapped["Block"] = relationship(back_populates="ads")
+    media_files: Mapped[List["AdMedia"]] = relationship(
+        back_populates="ad", cascade="all, delete-orphan", order_by="AdMedia.sort_order"
+    )
 
     __table_args__ = (
         Index("ix_ads_block_status_sub", "block_id", "status", "sub_type"),
@@ -270,7 +310,43 @@ class Ad(Base):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Settings (Admin tomonidan o'zgartiriladi)
+# AdMedia — up to 10 photos + 1 video per ad
+# ─────────────────────────────────────────────────────────────────────────────
+class AdMedia(Base):
+    """
+    Stores individual media files for an ad.
+    - photos: up to MAX_PHOTOS (10) per ad
+    - video:  up to 1 per ad, max 500 MB (checked at upload time)
+    sort_order: photos first (0..9), video last (100)
+    """
+    __tablename__ = "ad_media"
+
+    MAX_PHOTOS = 10
+    MAX_VIDEO_SIZE = 500 * 1024 * 1024   # 500 MB in bytes
+    VIDEO_SORT_ORDER = 100
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ad_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("ads.id", ondelete="CASCADE"), nullable=False
+    )
+    file_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    file_unique_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    media_type: Mapped[MediaType] = mapped_column(Enum(MediaType), nullable=False)
+    file_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)   # bytes
+    sort_order: Mapped[int] = mapped_column(SmallInteger, default=0, nullable=False)
+
+    ad: Mapped["Ad"] = relationship(back_populates="media_files")
+
+    __table_args__ = (
+        Index("ix_admedia_ad_id", "ad_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<AdMedia ad={self.ad_id} type={self.media_type} order={self.sort_order}>"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Settings
 # ─────────────────────────────────────────────────────────────────────────────
 class Setting(Base):
     __tablename__ = "settings"
@@ -287,7 +363,7 @@ class Setting(Base):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Throttle Log (Anti-flood tracking)
+# ThrottleLog
 # ─────────────────────────────────────────────────────────────────────────────
 class ThrottleLog(Base):
     __tablename__ = "throttle_logs"

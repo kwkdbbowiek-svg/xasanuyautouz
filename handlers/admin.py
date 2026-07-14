@@ -24,7 +24,7 @@ from config import settings
 from database.connection import AsyncSessionFactory, get_session
 from database.models import (
     Ad, AdStatus, Admin, AdminRole, Block, Payment, PaymentStatus,
-    Setting, Subscription, SubscriptionType, User, UserRole,
+    Setting, Subscription, SubscriptionType, User, UserAdLimit, UserRole,
 )
 from filters.admin_filters import IsAnyAdmin, IsSuperAdmin
 from utils.notify import notify_super_admins
@@ -39,15 +39,6 @@ router = Router(name="admin")
 class AdminStates(StatesGroup):
     # Settings
     set_standard_price = State()
-    set_vip_price = State()
-    set_buyer_sub_price = State()
-    set_seeker_sub_price = State()
-    set_standard_duration = State()
-    set_vip_duration = State()
-    set_standard_limit = State()
-    set_vip_limit = State()
-    set_payment_card = State()
-    set_payment_card_owner = State()
     # Blocks
     add_block_name = State()
     # Admins
@@ -56,6 +47,10 @@ class AdminStates(StatesGroup):
     # Reject reason
     reject_payment_reason = State()
     reject_ad_reason = State()
+    # User limit management
+    find_user_for_limit = State()
+    set_extra_limit_amount = State()
+    extend_sub_days = State()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,6 +81,7 @@ def _super_admin_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🏘️ Bloklarni boshqarish"), KeyboardButton(text="👥 Adminlarni boshqarish")],
             [KeyboardButton(text="📢 Reklama yuborish"), KeyboardButton(text="📥 Excel yuklab olish")],
             [KeyboardButton(text="⏳ Kutilayotgan to'lovlar"), KeyboardButton(text="📋 Kutilayotgan e'lonlar")],
+            [KeyboardButton(text="👤 Foydalanuvchi limitini o'zgartirish")],
         ],
         resize_keyboard=True,
     )
@@ -837,6 +833,428 @@ async def admin_excel(message: Message) -> None:
         doc = FSInputFile(file_path, filename="uysavdo_users.xlsx")
         await message.answer_document(doc, caption="📥 Foydalanuvchilar ro'yxati")
         import os
+        os.remove(file_path)
+    except Exception as exc:
+        logger.exception("admin_excel error")
+        await message.answer("⚠️ Excel fayl yaratishda xatolik yuz berdi.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# User Limit & Subscription Management (Super Admin only)
+# ─────────────────────────────────────────────────────────────────────────────
+@router.message(F.text == "👤 Foydalanuvchi limitini o'zgartirish", IsSuperAdmin())
+async def user_limit_start(message: Message, state: FSMContext) -> None:
+    await state.set_state(AdminStates.find_user_for_limit)
+    await message.answer(
+        "🔍 Foydalanuvchining Telegram ID yoki @username ni kiriting:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ Bekor qilish")]],
+            resize_keyboard=True,
+        ),
+    )
+
+
+@router.message(AdminStates.find_user_for_limit, IsSuperAdmin(), F.text)
+async def find_user_for_limit(message: Message, state: FSMContext, bot: Bot) -> None:
+    from sqlalchemy import func as sqlfunc
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        from aiogram.types import ReplyKeyboardRemove
+        await message.answer("❌ Bekor qilindi.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    query_text = message.text.strip().lstrip("@")
+    now = datetime.now(timezone.utc)
+
+    try:
+        async with AsyncSessionFactory() as session:
+            # Try by numeric ID first, then by username
+            user = None
+            if query_text.isdigit():
+                res = await session.execute(
+                    select(User).where(User.id == int(query_text))
+                )
+                user = res.scalar_one_or_none()
+            if user is None:
+                res = await session.execute(
+                    select(User).where(User.username == query_text)
+                )
+                user = res.scalar_one_or_none()
+
+        if not user:
+            await message.answer(
+                "❌ Foydalanuvchi topilmadi. Telegram ID yoki @username ni tekshiring."
+            )
+            return
+
+        # Fetch active subscription
+        async with AsyncSessionFactory() as session:
+            sub_res = await session.execute(
+                select(Subscription)
+                .where(
+                    Subscription.user_id == user.id,
+                    Subscription.sub_type.in_([
+                        SubscriptionType.standard, SubscriptionType.vip
+                    ]),
+                    Subscription.is_active == True,   # noqa: E712
+                    Subscription.expires_at > now,
+                )
+                .order_by(Subscription.expires_at.desc())
+            )
+            active_sub = sub_res.scalars().first()
+
+            # Current override
+            ov_res = await session.execute(
+                select(UserAdLimit).where(UserAdLimit.user_id == user.id)
+            )
+            override = ov_res.scalar_one_or_none()
+
+            # Current active ad count
+            count_res = await session.execute(
+                select(sqlfunc.count(Ad.id)).where(
+                    Ad.owner_id == user.id,
+                    Ad.status.in_([AdStatus.active, AdStatus.pending]),
+                )
+            )
+            active_ad_count = count_res.scalar_one()
+
+        role_labels = {
+            "seller": "🏠 Sotuvchi", "buyer": "🔍 Oluvchi",
+            "owner": "🏢 Kvartira egasi", "seeker": "🔑 Kvartira qidiruvchi",
+        }
+        role_str = role_labels.get(user.role.value if user.role else "", "—")
+        sub_info = "Faol obuna yo'q"
+        base_limit = 0
+        if active_sub:
+            base_limit_key = "vip_ads_limit" if active_sub.sub_type == SubscriptionType.vip else "standard_ads_limit"
+            base_limit = int(await _get_setting(base_limit_key))
+            sub_info = (
+                f"{active_sub.sub_type.value.upper()} — "
+                f"{active_sub.expires_at.strftime('%d.%m.%Y')} gacha"
+            )
+
+        extra = override.extra_limit if override else 0
+        total_limit = base_limit + extra
+
+        info_text = (
+            f"👤 <b>{html.escape(user.full_name)}</b>\n"
+            f"🆔 <code>{user.id}</code>\n"
+            f"Rol: {role_str}\n"
+            f"Obuna: {sub_info}\n"
+            f"📊 Asosiy limit: {base_limit} | Qo'shimcha: +{extra} | Jami: {total_limit}\n"
+            f"📋 Hozirgi e'lonlar: {active_ad_count}/{total_limit}"
+        )
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➕ Limit qo'shish", callback_data=f"ulimit_add:{user.id}"),
+                InlineKeyboardButton(text="0⃣ Limitni nolga", callback_data=f"ulimit_zero:{user.id}"),
+            ],
+            [
+                InlineKeyboardButton(text="📅 Obunani uzaytirish", callback_data=f"ulimit_extend:{user.id}"),
+            ],
+        ])
+
+        await state.update_data(target_user_id=user.id, target_user_name=user.full_name)
+        await state.clear()  # clear state but keep the inline buttons active
+        await message.answer(info_text, parse_mode="HTML", reply_markup=kb)
+
+    except Exception as exc:
+        logger.exception("find_user_for_limit error")
+        await notify_super_admins(bot, f"Limit qidirish xatosi: {exc}")
+        await message.answer("⚠️ Xatolik yuz berdi.")
+
+
+# ── Inline: Add extra limit ───────────────────────────────────────────────────
+@router.callback_query(F.data.startswith("ulimit_add:"), IsSuperAdmin())
+async def ulimit_add_start(call: CallbackQuery, state: FSMContext) -> None:
+    user_id = int(call.data.split(":")[1])
+    await state.update_data(target_user_id=user_id)
+    await state.set_state(AdminStates.set_extra_limit_amount)
+    await call.message.answer("➕ Qo'shiladigan limit sonini kiriting (masalan: 5 yoki 10):")
+    await call.answer()
+
+
+@router.message(AdminStates.set_extra_limit_amount, IsSuperAdmin(), F.text)
+async def set_extra_limit_amount(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    user_id = data["target_user_id"]
+    raw = message.text.strip()
+    if not raw.lstrip("+").isdigit():
+        await message.answer("⚠️ Faqat musbat raqam kiriting.")
+        return
+    extra = int(raw.lstrip("+"))
+    await state.clear()
+
+    try:
+        async with get_session() as session:
+            ov_res = await session.execute(
+                select(UserAdLimit).where(UserAdLimit.user_id == user_id).with_for_update()
+            )
+            override = ov_res.scalar_one_or_none()
+            if override:
+                override.extra_limit += extra
+                override.set_by = message.from_user.id
+            else:
+                session.add(UserAdLimit(
+                    user_id=user_id,
+                    extra_limit=extra,
+                    set_by=message.from_user.id,
+                ))
+
+        await message.answer(
+            f"✅ Foydalanuvchi <code>{user_id}</code> ga +{extra} ta qo'shimcha limit berildi.",
+            parse_mode="HTML",
+        )
+        try:
+            await bot.send_message(
+                user_id,
+                f"🎉 Admin sizga <b>+{extra}</b> ta qo'shimcha e'lon limiti berdi!\n"
+                f"Endi ko'proq e'lon bera olasiz.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.exception("set_extra_limit_amount error")
+        await message.answer("⚠️ Xatolik yuz berdi.")
+
+
+# ── Inline: Zero out limit ────────────────────────────────────────────────────
+@router.callback_query(F.data.startswith("ulimit_zero:"), IsSuperAdmin())
+async def ulimit_zero(call: CallbackQuery, bot: Bot) -> None:
+    user_id = int(call.data.split(":")[1])
+    try:
+        async with get_session() as session:
+            ov_res = await session.execute(
+                select(UserAdLimit).where(UserAdLimit.user_id == user_id).with_for_update()
+            )
+            override = ov_res.scalar_one_or_none()
+            if override:
+                override.extra_limit = 0
+                override.set_by = call.from_user.id
+            else:
+                session.add(UserAdLimit(user_id=user_id, extra_limit=0, set_by=call.from_user.id))
+
+        await call.answer("✅ Qo'shimcha limit nolga tushurildi!")
+        await call.message.edit_reply_markup(reply_markup=None)
+        await call.message.answer(
+            f"✅ Foydalanuvchi <code>{user_id}</code> ning qo'shimcha limiti nolga tushurildi.",
+            parse_mode="HTML",
+        )
+        try:
+            await bot.send_message(
+                user_id,
+                "ℹ️ Adminlar tomonidan qo'shimcha e'lon limitingiz nolga tushirildi."
+            )
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.exception("ulimit_zero error")
+        await call.answer("⚠️ Xatolik yuz berdi.", show_alert=True)
+
+
+# ── Inline: Extend subscription ───────────────────────────────────────────────
+@router.callback_query(F.data.startswith("ulimit_extend:"), IsSuperAdmin())
+async def ulimit_extend_start(call: CallbackQuery, state: FSMContext) -> None:
+    user_id = int(call.data.split(":")[1])
+    await state.update_data(target_user_id=user_id)
+    await state.set_state(AdminStates.extend_sub_days)
+    await call.message.answer(
+        "📅 Obunani necha kun uzaytirmoqchisiz? (masalan: 30):"
+    )
+    await call.answer()
+
+
+@router.message(AdminStates.extend_sub_days, IsSuperAdmin(), F.text)
+async def extend_sub_days(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    user_id = data["target_user_id"]
+    raw = message.text.strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        await message.answer("⚠️ Musbat raqam kiriting.")
+        return
+    days = int(raw)
+    await state.clear()
+    now = datetime.now(timezone.utc)
+
+    try:
+        async with get_session() as session:
+            sub_res = await session.execute(
+                select(Subscription)
+                .where(
+                    Subscription.user_id == user_id,
+                    Subscription.sub_type.in_([SubscriptionType.standard, SubscriptionType.vip]),
+                    Subscription.is_active == True,   # noqa: E712
+                )
+                .order_by(Subscription.expires_at.desc())
+                .with_for_update()
+            )
+            sub = sub_res.scalars().first()
+
+            if sub:
+                # If already expired, extend from now; otherwise from current expiry
+                base_dt = max(sub.expires_at, now)
+                sub.expires_at = base_dt + timedelta(days=days)
+                sub.is_active = True
+                new_expiry = sub.expires_at
+            else:
+                # Create a new free subscription
+                new_expiry = now + timedelta(days=days)
+                session.add(Subscription(
+                    user_id=user_id,
+                    sub_type=SubscriptionType.standard,
+                    starts_at=now,
+                    expires_at=new_expiry,
+                    is_active=True,
+                ))
+
+        await message.answer(
+            f"✅ Foydalanuvchi <code>{user_id}</code> obunasi "
+            f"<b>{days} kun</b> uzaytirildi.\n"
+            f"Yangi tugash sanasi: <b>{new_expiry.strftime('%d.%m.%Y')}</b>",
+            parse_mode="HTML",
+        )
+        try:
+            await bot.send_message(
+                user_id,
+                f"🎉 Admin tomonidan obunangiz <b>{days} kun</b> uzaytirildi!\n"
+                f"📅 Yangi tugash sanasi: <b>{new_expiry.strftime('%d.%m.%Y')}</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.exception("extend_sub_days error")
+        await notify_super_admins(bot, f"Obuna uzaytirish xatosi: {exc}")
+        await message.answer("⚠️ Xatolik yuz berdi.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Admin Management (Super Admin only)
+# ─────────────────────────────────────────────────────────────────────────────
+@router.message(F.text == "👥 Adminlarni boshqarish", IsSuperAdmin())
+async def manage_admins(message: Message) -> None:
+    try:
+        async with AsyncSessionFactory() as session:
+            result = await session.execute(
+                select(Admin).where(Admin.is_active == True).order_by(Admin.created_at)  # noqa: E712
+            )
+            admins = result.scalars().all()
+
+        text = "👥 <b>Yordamchi adminlar:</b>\n\n"
+        if admins:
+            for a in admins:
+                text += f"• {html.escape(a.full_name)} | <code>{a.telegram_id}</code> — {a.role.value}\n"
+        else:
+            text += "Hali yordamchi admin yo'q.\n"
+
+        role_buttons = [
+            [InlineKeyboardButton(text="➕ Seller Admin", callback_data="addadmin:seller_admin")],
+            [InlineKeyboardButton(text="➕ Buyer Admin", callback_data="addadmin:buyer_admin")],
+            [InlineKeyboardButton(text="➕ Owner Admin", callback_data="addadmin:owner_admin")],
+            [InlineKeyboardButton(text="➕ Seeker Admin", callback_data="addadmin:seeker_admin")],
+        ]
+        if admins:
+            role_buttons += [
+                [InlineKeyboardButton(
+                    text=f"🗑️ {a.full_name} ({a.role.value})",
+                    callback_data=f"deladmin:{a.telegram_id}"
+                )]
+                for a in admins
+            ]
+
+        kb = InlineKeyboardMarkup(inline_keyboard=role_buttons)
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    except Exception as exc:
+        logger.exception("manage_admins error")
+        await message.answer("⚠️ Xatolik yuz berdi.")
+
+
+@router.callback_query(F.data.startswith("addadmin:"), IsSuperAdmin())
+async def addadmin_start(call: CallbackQuery, state: FSMContext) -> None:
+    role_str = call.data.split(":")[1]
+    await state.update_data(new_admin_role=role_str)
+    await state.set_state(AdminStates.add_admin_id)
+    await call.message.answer(
+        f"👤 <b>{role_str}</b> uchun admin Telegram ID sini kiriting:",
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.message(AdminStates.add_admin_id, IsSuperAdmin(), F.text)
+async def addadmin_id(message: Message, state: FSMContext) -> None:
+    id_str = message.text.strip()
+    if not id_str.lstrip("-").isdigit():
+        await message.answer("⚠️ Telegram ID faqat raqamlardan iborat bo'lishi kerak.")
+        return
+    new_id = int(id_str)
+    data = await state.get_data()
+    role_str = data["new_admin_role"]
+    await state.clear()
+    try:
+        async with AsyncSessionFactory() as session:
+            u_res = await session.execute(select(User).where(User.id == new_id))
+            user = u_res.scalar_one_or_none()
+            full_name = user.full_name if user else f"Admin_{new_id}"
+
+        async with get_session() as session:
+            existing = await session.execute(select(Admin).where(Admin.telegram_id == new_id))
+            adm = existing.scalar_one_or_none()
+            if adm:
+                adm.role = AdminRole(role_str)
+                adm.is_active = True
+                adm.full_name = full_name
+            else:
+                session.add(Admin(
+                    telegram_id=new_id,
+                    full_name=full_name,
+                    role=AdminRole(role_str),
+                    added_by=message.from_user.id,
+                    is_active=True,
+                ))
+
+        await message.answer(
+            f"✅ <code>{new_id}</code> foydalanuvchisi <b>{role_str}</b> sifatida tayinlandi.",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        logger.exception("addadmin_id error")
+        await message.answer("⚠️ Xatolik yuz berdi.")
+
+
+@router.callback_query(F.data.startswith("deladmin:"), IsSuperAdmin())
+async def delete_admin(call: CallbackQuery) -> None:
+    admin_tid = int(call.data.split(":")[1])
+    try:
+        async with get_session() as session:
+            result = await session.execute(
+                select(Admin).where(Admin.telegram_id == admin_tid).with_for_update()
+            )
+            adm = result.scalar_one_or_none()
+            if adm:
+                adm.is_active = False
+        await call.answer(f"✅ Admin {admin_tid} o'chirildi!")
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception as exc:
+        logger.exception("delete_admin error")
+        await call.answer("⚠️ Xatolik yuz berdi.", show_alert=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Excel export shortcut from admin panel
+# ─────────────────────────────────────────────────────────────────────────────
+@router.message(F.text == "📥 Excel yuklab olish", IsSuperAdmin())
+async def admin_excel(message: Message) -> None:
+    from utils.excel_exporter import export_users_to_excel
+    import os
+    try:
+        await message.answer("⏳ Excel fayl tayyorlanmoqda...")
+        file_path = await export_users_to_excel()
+        from aiogram.types import FSInputFile
+        doc = FSInputFile(file_path, filename="uysavdo_users.xlsx")
+        await message.answer_document(doc, caption="📥 Foydalanuvchilar ro'yxati")
         os.remove(file_path)
     except Exception as exc:
         logger.exception("admin_excel error")

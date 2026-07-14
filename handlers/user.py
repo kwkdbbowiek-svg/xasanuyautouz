@@ -23,7 +23,7 @@ from sqlalchemy import select, func
 
 from database.connection import AsyncSessionFactory, get_session
 from database.models import (
-    Ad, AdStatus, AdType, Block, Payment, PaymentStatus,
+    Ad, AdMedia, AdStatus, AdType, Block, Payment, PaymentStatus,
     Setting, Subscription, SubscriptionType, User, UserRole,
 )
 from utils.notify import notify_super_admins
@@ -70,6 +70,9 @@ async def _upsert_user(tg_user) -> User:
 
 
 async def _active_subscription(user_id: int, sub_types: list[SubscriptionType]) -> Subscription | None:
+    """
+    FIX: Use .scalars().first() — user can have multiple historical rows.
+    """
     now = datetime.now(timezone.utc)
     async with AsyncSessionFactory() as session:
         result = await session.execute(
@@ -78,9 +81,9 @@ async def _active_subscription(user_id: int, sub_types: list[SubscriptionType]) 
                 Subscription.sub_type.in_(sub_types),
                 Subscription.is_active == True,  # noqa: E712
                 Subscription.expires_at > now,
-            )
+            ).order_by(Subscription.expires_at.desc())
         )
-        return result.scalar_one_or_none()
+        return result.scalars().first()   # ← NOT scalar_one_or_none()
 
 
 def _role_keyboard() -> ReplyKeyboardMarkup:
@@ -539,7 +542,16 @@ async def show_ads_in_block(call: CallbackQuery) -> None:
 
 
 async def _send_single_ad(message: Message, ad: Ad) -> None:
-    """Send one ad card with media (photo/video) if present."""
+    """Send one ad card. Loads AdMedia from DB and sends as album if multiple photos."""
+    from aiogram.types import InputMediaPhoto, InputMediaVideo
+
+    # Load media for this ad
+    async with AsyncSessionFactory() as session:
+        media_res = await session.execute(
+            select(AdMedia).where(AdMedia.ad_id == ad.id).order_by(AdMedia.sort_order)
+        )
+        media_files = media_res.scalars().all()
+
     badge = "⭐ VIP" if ad.sub_type == SubscriptionType.vip else "📦 Standart"
     ad_type_label = "🏠 Sotiladi" if ad.ad_type == AdType.sale else "🏢 Ijaraga beriladi"
     text = (
@@ -557,11 +569,28 @@ async def _send_single_ad(message: Message, ad: Ad) -> None:
     if ad.contact_phone:
         text += f"📞 Tel: {html.escape(ad.contact_phone)}\n"
 
+    photos = [m for m in media_files if m.media_type.value == "photo"]
+    videos = [m for m in media_files if m.media_type.value == "video"]
+
     try:
-        if ad.media_file_id and ad.media_type == "photo":
-            await message.answer_photo(photo=ad.media_file_id, caption=text, parse_mode="HTML")
-        elif ad.media_file_id and ad.media_type == "video":
-            await message.answer_video(video=ad.media_file_id, caption=text, parse_mode="HTML")
+        if len(photos) > 1:
+            # Send as media group (album)
+            media_group = [
+                InputMediaPhoto(
+                    media=photos[0].file_id,
+                    caption=text,
+                    parse_mode="HTML",
+                )
+            ] + [InputMediaPhoto(media=p.file_id) for p in photos[1:]]
+            await message.answer_media_group(media=media_group)
+        elif len(photos) == 1:
+            await message.answer_photo(
+                photo=photos[0].file_id, caption=text, parse_mode="HTML"
+            )
+        elif videos:
+            await message.answer_video(
+                video=videos[0].file_id, caption=text, parse_mode="HTML"
+            )
         else:
             await message.answer(text, parse_mode="HTML")
     except Exception:
